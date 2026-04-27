@@ -3,11 +3,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import psycopg2
 from docx import Document
 
 from .config import AppConfig
+from .db import get_connection
 from .embeddings import EmbeddingClient
+from .repositories import FDRepository
 
 SECTION_TYPES = {
     "Бизнес-процессы": "business_process",
@@ -36,19 +37,16 @@ DAX_RE = re.compile(r"DAX-\d+")
 def read_docx_text(path: Path) -> str:
     doc = Document(path)
     parts: list[str] = []
-
     for p in doc.paragraphs:
         text = p.text.strip()
         if text:
             parts.append(text)
-
     for table in doc.tables:
         for row in table.rows:
             cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
             line = " | ".join([c for c in cells if c])
             if line:
                 parts.append(line)
-
     return "\n".join(parts)
 
 
@@ -108,13 +106,7 @@ def split_into_sections(text: str) -> list[dict]:
 
     def flush() -> None:
         if current_lines:
-            sections.append(
-                {
-                    "section_title": current_title,
-                    "chunk_type": current_type,
-                    "text": "\n".join(current_lines).strip(),
-                }
-            )
+            sections.append({"section_title": current_title, "chunk_type": current_type, "text": "\n".join(current_lines).strip()})
 
     for line in lines:
         if line in SECTION_TYPES:
@@ -131,7 +123,7 @@ def chunk_text(text: str, max_chars: int = 1800, overlap: int = 250) -> list[str
     if len(text) <= max_chars:
         return [text]
 
-    chunks = []
+    chunks: list[str] = []
     start = 0
     while start < len(text):
         end = start + max_chars
@@ -146,23 +138,6 @@ def chunk_text(text: str, max_chars: int = 1800, overlap: int = 250) -> list[str
 
 def extract_entities(text: str) -> list[str]:
     found = {m.strip(".,;:()[]«»") for m in ENTITY_RE.findall(text) if len(m.strip(".,;:()[]«»")) >= 3}
-    for keyword in [
-        "WMS_IsOversizedItemIM",
-        "LFL_SCSPackTask",
-        "WMSPickingRoute",
-        "WMSOrderTrans",
-        "PickingLineBuffer",
-        "SalesTable",
-        "InventTable",
-        "WMSStoreArea",
-        "WMS_TSDTaskType",
-        "WMS_OperationType",
-        "tsd_Setup",
-        "tsd_AutoTaskTable",
-        "tsd_WMSLocation",
-    ]:
-        if keyword in text:
-            found.add(keyword)
     return sorted(found)
 
 
@@ -181,108 +156,20 @@ def guess_process_type(text: str) -> str | None:
     return None
 
 
-def insert_document(cur, meta: dict) -> int:
-    cur.execute(
-        """
-        INSERT INTO ai.fd_documents
-            (title, source_file, dax_code, version, business_process, purpose, author, document_date, source_type)
-        VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """,
-        (
-            meta["title"],
-            meta["source_file"],
-            meta["dax_code"],
-            meta["version"],
-            meta["business_process"],
-            meta["purpose"],
-            meta["author"],
-            meta["document_date"],
-            meta["source_type"],
-        ),
-    )
-    return cur.fetchone()[0]
+def rebuild_document_links(repo: FDRepository) -> None:
+    repo.cur.execute("DELETE FROM ai.fd_document_links")
+    repo.cur.execute("SELECT id, dax_code FROM ai.fd_documents WHERE dax_code IS NOT NULL")
+    docs = {dax: doc_id for doc_id, dax in repo.cur.fetchall()}
+    repo.cur.execute("SELECT document_id, chunk_text FROM ai.fd_chunks WHERE chunk_type = 'related_modifications'")
 
-
-def insert_entity(cur, name: str) -> int:
-    cur.execute(
-        """
-        INSERT INTO ai.fd_entities (name)
-        VALUES (%s)
-        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-        RETURNING id
-        """,
-        (name,),
-    )
-    return cur.fetchone()[0]
-
-
-def insert_chunk(cur, embedding_client: EmbeddingClient, document_id: int, chunk: str, section_title: str, chunk_type: str, entities: list[str]) -> int:
-    embedding = embedding_client.get_embedding(chunk)
-    cur.execute(
-        """
-        INSERT INTO ai.fd_chunks
-            (document_id, chunk_text, embedding, section_title, chunk_type, business_terms, jira_keys, process_type)
-        VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """,
-        (
-            document_id,
-            chunk,
-            embedding,
-            section_title,
-            chunk_type,
-            [],
-            DAX_RE.findall(chunk),
-            guess_process_type(chunk),
-        ),
-    )
-    chunk_id = cur.fetchone()[0]
-
-    for entity in entities:
-        entity_id = insert_entity(cur, entity)
-        cur.execute(
-            """
-            INSERT INTO ai.fd_chunk_entities (chunk_id, entity_id)
-            VALUES (%s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            (chunk_id, entity_id),
-        )
-    return chunk_id
-
-
-def insert_links_after_load(cur) -> None:
-    cur.execute("SELECT id, dax_code FROM ai.fd_documents WHERE dax_code IS NOT NULL")
-    docs = {dax: doc_id for doc_id, dax in cur.fetchall()}
-
-    cur.execute(
-        """
-        SELECT c.document_id, c.chunk_text
-        FROM ai.fd_chunks c
-        WHERE c.chunk_type = 'related_modifications'
-        """
-    )
-
-    for source_document_id, text in cur.fetchall():
+    for source_document_id, text in repo.cur.fetchall():
         for dax in set(DAX_RE.findall(text)):
             target_id = docs.get(dax)
             if target_id and target_id != source_document_id:
-                cur.execute(
-                    """
-                    INSERT INTO ai.fd_document_links
-                        (source_document_id, target_document_id, link_type)
-                    VALUES
-                        (%s, %s, %s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (source_document_id, target_id, "related"),
-                )
+                repo.insert_document_link(source_document_id, target_id, "related")
 
 
-def load_docx_batch(config: AppConfig | None = None) -> None:
+def load_docx_batch(config: AppConfig | None = None, replace_existing: bool = True) -> None:
     config = config or AppConfig()
     files = sorted({p.resolve() for p in config.docx_folder.glob("*") if p.suffix.lower() == ".docx"})
     if not files:
@@ -290,32 +177,48 @@ def load_docx_batch(config: AppConfig | None = None) -> None:
         return
 
     embedding_client = EmbeddingClient(config.ollama_url, config.ollama_model)
-    conn = psycopg2.connect(**config.db_config)
-    cur = conn.cursor()
+    with get_connection(config) as conn:
+        cur = conn.cursor()
+        repo = FDRepository(cur)
 
-    for path in files:
-        print(f"Загружаю: {path.name}")
-        text = read_docx_text(path)
-        document_id = insert_document(cur, parse_doc_metadata(text, path.name))
+        for path in files:
+            print(f"Загружаю: {path.name}")
+            if replace_existing:
+                old_id = repo.find_document_id_by_source_file(path.name)
+                if old_id:
+                    repo.delete_document_graph(old_id)
 
-        chunk_count = 0
-        for section in split_into_sections(text):
-            for chunk in chunk_text(section["text"]):
-                insert_chunk(
-                    cur=cur,
-                    embedding_client=embedding_client,
-                    document_id=document_id,
-                    chunk=chunk,
-                    section_title=section["section_title"],
-                    chunk_type=section["chunk_type"],
-                    entities=extract_entities(chunk),
-                )
-                chunk_count += 1
+            text = read_docx_text(path)
+            document_id = repo.insert_document(parse_doc_metadata(text, path.name))
 
-        print(f"  document_id={document_id}, chunks={chunk_count}")
+            chunk_count = 0
+            for section in split_into_sections(text):
+                for chunk in chunk_text(section["text"]):
+                    chunk_id = repo.insert_chunk(
+                        {
+                            "document_id": document_id,
+                            "chunk_text": chunk,
+                            "embedding": embedding_client.get_embedding(chunk),
+                            "section_title": section["section_title"],
+                            "chunk_type": section["chunk_type"],
+                            "business_terms": [],
+                            "jira_keys": DAX_RE.findall(chunk),
+                            "process_type": guess_process_type(chunk),
+                        }
+                    )
+                    for entity_name in extract_entities(chunk):
+                        repo.link_chunk_entity(chunk_id, repo.insert_entity(entity_name))
+                    chunk_count += 1
 
-    insert_links_after_load(cur)
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("Готово: документы загружены")
+            print(f"  document_id={document_id}, chunks={chunk_count}")
+
+        rebuild_document_links(repo)
+        conn.commit()
+
+        stats = repo.get_table_stats()
+        print(
+            "Готово. Текущие размеры (строки): "
+            f"fd_chunks={stats.fd_chunks}, fd_documents={stats.fd_documents}, "
+            f"fd_document_links={stats.fd_document_links}, fd_entities={stats.fd_entities}, "
+            f"fd_chunk_entities={stats.fd_chunk_entities}"
+        )

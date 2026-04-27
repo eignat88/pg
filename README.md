@@ -1,20 +1,27 @@
 # fd-project
 
-Небольшой Python-проект для:
-- загрузки функциональных документов (`.docx`) в PostgreSQL;
-- построения embedding через Ollama;
-- семантического поиска по загруженным фрагментам.
+Проект для загрузки функциональных документов (`.docx`) в PostgreSQL и семантического поиска по ним.
+
+## Актуальная модель БД
+
+Код ориентирован на следующие таблицы в схеме `ai`:
+- `fd_chunks`
+- `fd_documents`
+- `fd_document_links`
+- `fd_entities`
+- `fd_chunk_entities`
+
+Добавлена отдельная CLI-команда для проверки фактических количеств строк в этих таблицах.
 
 ## Структура
 
-- `fd_project/config.py` — централизованная конфигурация через env-переменные;
-- `fd_project/embeddings.py` — клиент для Ollama embeddings API;
-- `fd_project/loader_service.py` — обработка DOCX и загрузка в БД;
-- `fd_project/search_service.py` — семантический поиск по chunk-ам;
-- `fd_project/cli_load_docx.py` — CLI для загрузки документов.
-
-Совместимость сохранена:
-- `load_fd_docx.py` и `search.py` оставлены как тонкие wrappers.
+- `fd_project/config.py` — конфигурация через env-переменные;
+- `fd_project/db.py` — подключение к PostgreSQL;
+- `fd_project/repositories.py` — операции с таблицами `ai.fd_*`;
+- `fd_project/loader_service.py` — чтение DOCX, чанкование, загрузка и пересборка связей;
+- `fd_project/search_service.py` — семантический поиск с подгрузкой entities и связанных документов;
+- `fd_project/cli_load_docx.py` — CLI загрузки DOCX;
+- `fd_project/cli_stats.py` — CLI статистики по таблицам.
 
 ## Быстрый старт
 
@@ -37,16 +44,25 @@ pip install -e .
 
 ## Использование
 
+### Проверка размеров таблиц
+
+```bash
+fd-db-stats
+```
+
 ### Загрузка DOCX
 
 ```bash
 fd-load-docx --docx-folder ./docs
 ```
 
-или
+По умолчанию загрузка работает в режиме *replace* по `source_file`: если документ с таким именем уже есть,
+он удаляется вместе с зависимыми chunk/link-связями и загружается заново.
+
+Чтобы отключить replace-поведение:
 
 ```bash
-python load_fd_docx.py --docx-folder ./docs
+fd-load-docx --docx-folder ./docs --no-replace
 ```
 
 ### Поиск
@@ -55,8 +71,11 @@ python load_fd_docx.py --docx-folder ./docs
 fd-search "подбирать партии без маркировки" --limit 5
 ```
 
-или
+Вывод включает score, chunk, entities и связанные document id.
 
-```bash
-python search.py "подбирать партии без маркировки" --limit 5
-```
+## Backward compatibility
+
+Старые скрипты оставлены как thin wrappers:
+- `load_fd_docx.py`
+- `search.py`
+- `test_embedding.py`

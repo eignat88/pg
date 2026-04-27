@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fd-project"
-version = "0.1.0"
+version = "0.2.0"
 description = "FD document loading and semantic search utilities"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 fd-search = "fd_project.search_service:main"
 fd-load-docx = "fd_project.cli_load_docx:main"
+fd-db-stats = "fd_project.cli_stats:main"
 
 [tool.setuptools]
 packages = ["fd_project"]
