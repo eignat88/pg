@@ -1,17 +1,10 @@
-import requests
+from fd_project.config import AppConfig
+from fd_project.embeddings import EmbeddingClient
 
-def get_embedding(text):
-    response = requests.post(
-        "http://localhost:11434/api/embeddings",
-        json={
-            "model": "nomic-embed-text",
-            "prompt": text
-        }
+
+if __name__ == "__main__":
+    config = AppConfig()
+    embedding = EmbeddingClient(config.ollama_url, config.ollama_model).get_embedding(
+        "подбирать партии без маркировки"
     )
-    return response.json()["embedding"]
-
-text = "подбирать партии без маркировки"
-
-embedding = get_embedding(text)
-
-print(len(embedding))
+    print(len(embedding))
